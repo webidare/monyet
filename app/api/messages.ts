@@ -1,9 +1,18 @@
 // pages/api/messages.ts
 import { NextApiRequest, NextApiResponse } from 'next';
-import { sql } from '@vercel/postgres';
+import { sql, withTransaction } from '@/lib/db';
+import { rateLimit } from '@/lib/rate-limit';
+
+const limiter = rateLimit({
+  interval: 60 * 1000, // 1 minute
+  uniqueTokenPerInterval: 500
+});
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
+    // Apply rate limiting
+    await limiter.check(res, 10, 'CACHE_TOKEN');
+
     if (req.method === 'POST') {
       const { recipient, message, intensity } = req.body;
 
@@ -20,14 +29,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         });
       }
 
-      // Let PostgreSQL handle UUID generation
-      const result = await sql`
-        INSERT INTO love_messages (recipient, message, intensity)
-        VALUES (${recipient}, ${message}, ${intensity})
-        RETURNING id;
-      `;
-      
-      return res.status(200).json({ id: result.rows[0].id });
+      // Use transaction for data integrity
+      const result = await withTransaction(async (client) => {
+        const { rows } = await client.query(
+          'INSERT INTO love_messages (recipient, message, intensity) VALUES ($1, $2, $3) RETURNING id',
+          [recipient, message, intensity]
+        );
+        return rows[0];
+      });
+
+      return res.status(200).json({ id: result.id });
 
     } else if (req.method === 'GET') {
       const { recipient = '' } = req.query;
@@ -38,14 +49,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         });
       }
 
-      const result = await sql`
-        SELECT * FROM love_messages
-        WHERE recipient ILIKE ${`%${recipient}%`}
-        ORDER BY created_at DESC
-        LIMIT 50;
-      `;
-      
-      return res.status(200).json(result.rows);
+      const { rows } = await sql.query(
+        `SELECT * FROM love_messages 
+         WHERE recipient ILIKE $1 
+         ORDER BY created_at DESC 
+         LIMIT 50`,
+        [`%${recipient}%`]
+      );
+
+      return res.status(200).json(rows);
 
     } else {
       return res.status(405).json({ 
@@ -55,7 +67,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   } catch (error) {
     console.error('API Error:', error);
     return res.status(500).json({ 
-      error: 'Internal server error' 
+      error: 'Internal server error',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 }
